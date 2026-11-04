@@ -1,0 +1,1030 @@
+import asyncio
+import json
+import logging
+import os
+import threading
+import uuid
+import sqlite3
+import secrets
+import time
+import aiohttp
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.filters import CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardRemove
+)
+
+TOKEN = "8991979849:AAGYJLprqchCSn0nURRvshWX88w5exLGoZs"
+bot = Bot(token=TOKEN)
+
+
+logging.basicConfig(level=logging.INFO)
+router = Router()
+WEB_HOST = "127.0.0.1"
+WEB_PORT = int(os.getenv("VERVE_WEB_PORT", "8765"))
+ORDERS_FILE = Path(__file__).resolve().with_name("verve_orders.json")
+ORDERS_DB = Path(__file__).resolve().with_name("verve_orders.db")
+ORDERS_LOCK = threading.Lock()
+ADMIN_PASSWORD = os.getenv("VERVE_ADMIN_PASSWORD", "verve2026")
+ADMIN_SESSIONS: dict[str, float] = {}
+
+
+def find_website_file() -> Path:
+    explicit = os.getenv("VERVE_WEBSITE_FILE")
+    candidates = [
+        Path(explicit) if explicit else None,
+        Path(__file__).resolve().with_name("verveorders (1).html"),
+        Path(__file__).resolve().with_name("telelgramm.html"),
+        Path(__file__).resolve().parent.parent / "telelgramm.html",
+    ]
+    for candidate in candidates:
+        if candidate and candidate.is_file():
+            return candidate.resolve()
+
+    html_files = sorted(Path(__file__).resolve().parent.glob("*.html"))
+    if html_files:
+        return html_files[0]
+    return Path(__file__).resolve().with_name("verveorders.html")
+
+
+WEBSITE_FILE = find_website_file()
+
+
+def init_order_database() -> None:
+    with sqlite3.connect(ORDERS_DB) as connection:
+        connection.execute("PRAGMA journal_mode=WAL;")
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+        """)
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_orders_updated ON orders(updated_at)")
+
+    if ORDERS_FILE.exists():
+        try:
+            legacy_orders = json.loads(ORDERS_FILE.read_text(encoding="utf-8"))
+            if isinstance(legacy_orders, list):
+                for order in legacy_orders:
+                    if isinstance(order, dict) and isinstance(order.get("id"), str):
+                        save_order_to_database(order)
+        except (json.JSONDecodeError, OSError):
+            logging.exception("Could not migrate legacy JSON orders.")
+
+
+def read_telegram_orders() -> list[dict]:
+    init_order_database()
+    with sqlite3.connect(ORDERS_DB) as connection:
+        rows = connection.execute(
+            "SELECT payload FROM orders ORDER BY updated_at DESC, created_at DESC"
+        ).fetchall()
+    orders = []
+    for (payload,) in rows:
+        try:
+            order = json.loads(payload)
+            if isinstance(order, dict):
+                orders.append(order)
+        except json.JSONDecodeError:
+            logging.exception("Skipping a corrupted database order row.")
+    return orders
+
+
+def save_order_to_database(order: dict) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(ORDERS_DB) as connection:
+        connection.execute("""
+            INSERT INTO orders (id, source, status, created_at, updated_at, payload)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                source=excluded.source,
+                status=excluded.status,
+                updated_at=excluded.updated_at,
+                payload=excluded.payload
+        """, (
+            order["id"],
+            str(order.get("source", "website")),
+            str(order.get("status", "pending")),
+            str(order.get("createdAt", now)),
+            now,
+            json.dumps(order, ensure_ascii=False)
+        ))
+        connection.commit()
+
+
+def save_telegram_order(order: dict) -> None:
+    with ORDERS_LOCK:
+        save_order_to_database(order)
+
+
+ALLOWED_ORDER_STATUSES = {"pending", "accepted", "preparing", "ready", "delivered", "cancelled"}
+
+
+def update_telegram_order_status(order_id: str, status: str) -> dict:
+    with ORDERS_LOCK:
+        orders = read_telegram_orders()
+        order = next((item for item in orders if item.get("id") == order_id), None)
+        if order is None:
+            raise KeyLookupError(order_id)
+        order["status"] = status
+        order["statusUpdatedAt"] = datetime.now(timezone.utc).isoformat()
+        save_order_to_database(order)
+    asyncio.run(send_telegram_status_notification(order))
+    return order
+
+
+class KeyLookupError(LookupError):
+    pass
+
+
+class VerveRequestHandler(BaseHTTPRequestHandler):
+    def send_json(self, status: int, payload: object) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_OPTIONS(self) -> None:
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS")
+        self.end_headers()
+
+    def is_admin_authorized(self) -> bool:
+        authorization = self.headers.get("Authorization", "")
+        if not authorization.startswith("Bearer "):
+            return False
+        token = authorization[7:].strip()
+        expires_at = ADMIN_SESSIONS.get(token)
+        if expires_at is None:
+            return False
+        if expires_at < time.time():
+            ADMIN_SESSIONS.pop(token, None)
+            return False
+        return True
+
+    def read_json_body(self, limit: int = 1_000_000) -> object:
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            raise ValueError("Invalid Content-Length.")
+        if not 0 < content_length <= limit:
+            raise ValueError("Request body size is invalid.")
+        return json.loads(self.rfile.read(content_length))
+
+    def do_PATCH(self) -> None:
+        if not self.is_admin_authorized():
+            self.send_json(401, {"error": "Admin authentication required."})
+            return
+        prefix = "/api/orders/"
+        if not self.path.startswith(prefix):
+            self.send_error(404)
+            return
+        order_id = self.path[len(prefix):].strip()
+        if not order_id:
+            self.send_json(400, {"error": "Order id is required."})
+            return
+        try:
+            payload = self.read_json_body()
+        except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as error:
+            self.send_json(400, {"error": str(error)})
+            return
+        if not isinstance(payload, dict) or payload.get("status") not in ALLOWED_ORDER_STATUSES:
+            self.send_json(400, {"error": "Status is invalid."})
+            return
+        try:
+            order = update_telegram_order_status(order_id, payload["status"])
+        except KeyLookupError:
+            self.send_json(404, {"error": "Order was not found."})
+            return
+        except (OSError, ValueError, json.JSONDecodeError):
+            logging.exception("Could not update order %s.", order_id)
+            self.send_json(500, {"error": "Could not update the order."})
+            return
+        self.send_json(200, {"id": order["id"], "status": order["status"]})
+
+    def do_GET(self) -> None:
+        if self.path == "/api/health":
+            self.send_json(200, {"ok": True, "websiteFile": WEBSITE_FILE.name, "database": ORDERS_DB.name})
+            return
+
+        if self.path == "/api/events":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            last_signature = ""
+            try:
+                while True:
+                    orders = read_telegram_orders()
+                    signature = json.dumps([(o.get("id"), o.get("status"), o.get("statusUpdatedAt")) for o in orders], ensure_ascii=False)
+                    if signature != last_signature:
+                        self.wfile.write(f"data: {json.dumps({'type':'orders','count':len(orders)}, ensure_ascii=False)}\n\n".encode("utf-8"))
+                        self.wfile.flush()
+                        last_signature = signature
+                    time.sleep(2)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+
+        if self.path == "/api/backup":
+            if not self.is_admin_authorized():
+                self.send_json(401, {"error": "Admin authentication required."})
+                return
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            backup = ORDERS_DB.with_name(f"verve_orders_backup_{timestamp}.db")
+            with sqlite3.connect(ORDERS_DB) as source, sqlite3.connect(backup) as destination:
+                source.backup(destination)
+            self.send_json(200, {"saved": True, "file": backup.name})
+            return
+
+        if self.path == "/api/orders":
+            try:
+                with ORDERS_LOCK:
+                    orders = read_telegram_orders()
+            except (OSError, ValueError, json.JSONDecodeError):
+                logging.exception("Could not read Telegram orders.")
+                self.send_json(500, {"error": "Could not read Telegram orders."})
+                return
+            self.send_json(200, orders)
+            return
+
+        if self.path in {"/", "/telelgramm.html", "/telegramm.html"}:
+            try:
+                page = WEBSITE_FILE.read_bytes()
+            except OSError:
+                logging.exception("Could not read the website file at %s.", WEBSITE_FILE)
+                self.send_error(404, "Website file was not found.")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(page)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(page)
+            return
+
+        self.send_error(404)
+
+    def do_POST(self) -> None:
+        if self.path == "/api/admin/login":
+            try:
+                content_length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(content_length))
+            except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
+                self.send_json(400, {"error": "Invalid login request."})
+                return
+            if not isinstance(payload, dict):
+                self.send_json(400, {"error": "Invalid login request."})
+                return
+            if not secrets.compare_digest(str(payload.get("password", "")), ADMIN_PASSWORD):
+                self.send_json(401, {"error": "Incorrect password."})
+                return
+            token = secrets.token_urlsafe(32)
+            ADMIN_SESSIONS[token] = time.time() + 12 * 60 * 60
+            self.send_json(200, {"token": token, "expiresIn": 12 * 60 * 60})
+            return
+
+        if self.path != "/api/orders":
+            self.send_error(404)
+            return
+
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self.send_json(400, {"error": "Invalid Content-Length."})
+            return
+        if not 0 < content_length <= 1_000_000:
+            self.send_json(400, {"error": "Order payload size is invalid."})
+            return
+
+        try:
+            order = json.loads(self.rfile.read(content_length))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self.send_json(400, {"error": "Request body must be valid JSON."})
+            return
+        if (
+            not isinstance(order, dict)
+            or not isinstance(order.get("id"), str)
+            or not order["id"].strip()
+            or not isinstance(order.get("customer"), dict)
+            or not isinstance(order.get("items"), list)
+            or not isinstance(order.get("totals"), dict)
+            or order.get("source") not in {"telegram", "website"}
+        ):
+            self.send_json(400, {"error": "Order is missing required fields or source is invalid."})
+            return
+
+        order = dict(order)
+        order.setdefault("status", "pending")
+        order.setdefault("createdAt", datetime.now(timezone.utc).isoformat())
+
+        try:
+            save_telegram_order(order)
+        except (OSError, ValueError, json.JSONDecodeError):
+            logging.exception("Could not save Telegram order %s.", order["id"])
+            self.send_json(500, {"error": "Could not save Telegram order."})
+            return
+        self.send_json(201, {"id": order["id"], "saved": True})
+
+    def log_message(self, format: str, *args: object) -> None:
+        logging.info("Website server: " + format, *args)
+
+
+async def send_telegram_status_notification(order: dict) -> None:
+    telegram_user_id = order.get("telegramUserId")
+    if not telegram_user_id or not TOKEN:
+        return
+    message = f"📦 Buyurtma {order['id']} holati: {order['status']}"
+    try:
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                json={"chat_id": telegram_user_id, "text": message}
+            ) as response:
+                await response.read()
+                if response.status != 200:
+                    logging.warning("Telegram status notification returned HTTP %s", response.status)
+    except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+        logging.warning("Could not send Telegram status notification: %s", error)
+
+
+async def send_order_to_website(order: dict) -> None:
+    timeout = aiohttp.ClientTimeout(total=5)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(
+            f"http://{WEB_HOST}:{WEB_PORT}/api/orders",
+            json=order
+        ) as response:
+            result = await response.json()
+            if response.status != 201 or not isinstance(result, dict) or result.get("id") != order["id"]:
+                raise RuntimeError("The website server did not confirm the saved order.")
+
+
+def start_order_server() -> threading.Thread:
+    init_order_database()
+    server = ThreadingHTTPServer((WEB_HOST, WEB_PORT), VerveRequestHandler)
+    thread = threading.Thread(target=server.serve_forever, name="verve-order-server", daemon=True)
+    thread.start()
+    logging.info("Verve order server listening at http://%s:%s", WEB_HOST, WEB_PORT)
+    logging.info("Serving website file: %s", WEBSITE_FILE)
+    return thread
+
+
+# ==================== FSM STATES ====================
+class CheckoutState(StatesGroup):
+    waiting_for_phone = State()
+    waiting_for_location = State()
+    waiting_for_payment = State()
+
+
+class TableState(StatesGroup):
+    waiting_for_details = State()
+
+
+# ==================== DATABASE / DATA STRUCTURES ====================
+
+MENU_DATA = {
+    "uz": {
+        "cat_mains": "🍲 Milliy Taomlar & Asosiy",
+        "cat_fast": "🍔 Fast-Food & Gazaklar",
+        "cat_drinks": "🥤 Ichimliklar & Desertlar",
+        "items": {
+            # Mains
+            "osh": {"name": "Buxoro Oshi", "price": 45000, "cat": "cat_mains",
+                    "desc": "An'anaviy Buxorocha palov mol go'shti, nuxat va ziravorlar bilan."},
+            "manti": {"name": "Qovurilgan Manti", "price": 38000, "cat": "cat_mains",
+                      "desc": "Tilla rang qarsildoq qobiqli, maxsus sous bilan tortiladigan manti."},
+            "shashlik": {"name": "Qo'y Go'shti Shashlik", "price": 25000, "cat": "cat_mains",
+                         "desc": "Cho'g'da pishirilgan yumshoq qo'y go'shti shashigi (1 dona)."},
+
+            # Fast-Food
+            "burger": {"name": "Verve King Burger", "price": 55000, "cat": "cat_fast",
+                       "desc": "Ikki qavatli mol go'shti kotleti, erigan pishloq va maxsus firmenniy sous."},
+            "cheeseburger": {"name": "Cheeseburger Classic", "price": 42000, "cat": "cat_fast",
+                             "desc": "Klassik mol go'shti kotleti, cheedder pishloqi, tuzlangan bodring va ketchup."},
+            "hotdog": {"name": "Royal Hot-Dog", "price": 25000, "cat": "cat_fast",
+                       "desc": "Sharqona uslubda tayyorlangan sosiska, maxsus souslar va qarsildoq piyoz."},
+            "club": {"name": "Klab Sendvich", "price": 42000, "cat": "cat_fast",
+                     "desc": "Tovuq go'shti, pomidor, maxsus non va kartoshka fri bilan."},
+            "fries": {"name": "Kartoshka Fri", "price": 18000, "cat": "cat_fast",
+                      "desc": "Tilla rang qarsildoq kartoshka bo'lakchalari, ketchup bilan."},
+            "nuggets": {"name": "Tovuq Nuggetslari (6 dona)", "price": 32000, "cat": "cat_fast",
+                        "desc": "Qarsildoq non talqoniga o'ralgan yumshoq tovuq go'shti bo'laklari."},
+
+            # Drinks & Desserts
+            "lemonade": {"name": "Minta-Limon Limonad", "price": 20000, "cat": "cat_drinks",
+                         "desc": "Yalpiz, limondan tayyorlangan tetiklashtiruvchi muzli ichimlik (400ml)."},
+            "baklava": {"name": "Asalli Paxlava", "price": 28000, "cat": "cat_drinks",
+                        "desc": "Yong'oq va tabiiy asal qo'shilgan sharqona shirinlik."}
+        }
+    },
+    "en": {
+        "cat_mains": "🍲 National & Mains",
+        "cat_fast": "🍔 Fast-Food & Snacks",
+        "cat_drinks": "🥤 Drinks & Desserts",
+        "items": {
+            # Mains
+            "osh": {"name": "Bukhara Osh (Plov)", "price": 45000, "cat": "cat_mains",
+                    "desc": "Traditional Bukharian rice dish with tender beef, chickpeas, and spices."},
+            "manti": {"name": "Fried Manti", "price": 38000, "cat": "cat_mains",
+                      "desc": "Golden-crisped steamed dumplings served with a signature dipping sauce."},
+            "shashlik": {"name": "Mutton Shashlik", "price": 25000, "cat": "cat_mains",
+                         "desc": "Juicy charcoal-grilled lamb skewers (1 piece)."},
+
+            # Fast-Food
+            "burger": {"name": "Verve King Burger", "price": 55000, "cat": "cat_fast",
+                       "desc": "Double beef patty, melted cheddar cheese, and house signature sauce."},
+            "cheeseburger": {"name": "Classic Cheeseburger", "price": 42000, "cat": "cat_fast",
+                             "desc": "Juicy beef patty with melted cheddar, pickles, and signature ketchup."},
+            "hotdog": {"name": "Royal Hot-Dog", "price": 25000, "cat": "cat_fast",
+                       "desc": "Savory sausage in a soft bun with special sauces and crispy onions."},
+            "club": {"name": "Club Sandwich", "price": 42000, "cat": "cat_fast",
+                     "desc": "Layered chicken, fresh tomatoes, crisp greens, served with french fries."},
+            "fries": {"name": "French Fries", "price": 18000, "cat": "cat_fast",
+                      "desc": "Crispy golden potato strips served with ketchup."},
+            "nuggets": {"name": "Chicken Nuggets (6 pcs)", "price": 32000, "cat": "cat_fast",
+                        "desc": "Tender bite-sized chicken breast pieces in a crispy breadcrumb coating."},
+
+            # Drinks & Desserts
+            "lemonade": {"name": "Mint-Lime Lemonade", "price": 20000, "cat": "cat_drinks",
+                         "desc": "Refreshing iced beverage with fresh mint and lime extracts (400ml)."},
+            "baklava": {"name": "Honey Baklava", "price": 28000, "cat": "cat_drinks",
+                        "desc": "Flaky Eastern pastry layered with walnuts and natural honey syrup."}
+        }
+    },
+    "ru": {
+        "cat_mains": "🍲 Национальные & Основные",
+        "cat_fast": "🍔 Фаст-фуд & Снеки",
+        "cat_drinks": "🥤 Напитки & Десерты",
+        "items": {
+            # Mains
+            "osh": {"name": "Бухарский Ош (Плов)", "price": 45000, "cat": "cat_mains",
+                    "desc": "Традиционный бухарский плов с нежной говядиной, нутом и специями."},
+            "manti": {"name": "Жареные Манты", "price": 38000, "cat": "cat_mains",
+                      "desc": "Манты с золотистой хрустящей корочкой, подаются с фирменным соусом."},
+            "shashlik": {"name": "Шашлык из Баранины", "price": 25000, "cat": "cat_mains",
+                         "desc": "Сочные кусочки баранины на углях (1 шт)."},
+
+            # Fast-Food
+            "burger": {"name": "Фирменный Бургер Verve", "price": 55000, "cat": "cat_fast",
+                       "desc": "Двойная говяжья котлета, плавленый сыр чеддер и фирменный соус."},
+            "cheeseburger": {"name": "Классический Чизбургер", "price": 42000, "cat": "cat_fast",
+                             "desc": "Сочная говяжья котлета, сыр чеддер, маринованные огурцы и соус."},
+            "hotdog": {"name": "Роял Хот-Дог", "price": 25000, "cat": "cat_fast",
+                       "desc": "Сосиска в мягкой булочке с фирменными соусами и хрустящим луком."},
+            "club": {"name": "Клаб Сэндвич", "price": 42000, "cat": "cat_fast",
+                     "desc": "С куриным филе, томатами, зеленью и картофелем фри."},
+            "fries": {"name": "Картофель Фри", "price": 18000, "cat": "cat_fast",
+                      "desc": "Золотистый хрустящий картофель с кетчупом."},
+            "nuggets": {"name": "Куриные Наггетсы (6 шт)", "price": 32000, "cat": "cat_fast",
+                        "desc": "Нежное куриное филе в хрустящей панировке."},
+
+            # Drinks & Desserts
+            "lemonade": {"name": "Мятно-Лаймовый Лимонад", "price": 20000, "cat": "cat_drinks",
+                         "desc": "Освежающий ледяной напиток с мятой и лаймом (400мл)."},
+            "baklava": {"name": "Медовая Пахлава", "price": 28000, "cat": "cat_drinks",
+                        "desc": "Восточная сладость с грецким орехом и натуральным медовым сиропом."}
+        }
+    }
+}
+
+UI_TEXT = {
+    "uz": {
+        "welcome": "✨ **Verve Kitchen Bukhara**ga xush kelibsiz!\n\nBizning mazali taomlarimizni tatib ko'ring, stol bron qiling yoki buyurtma bering. Iltimos, kerakli bo'limni tanlang:",
+        "btn_menu": "🍽 Menyu",
+        "btn_cart": "🛒 Savatcha",
+        "btn_profile": "🌟 Verve Profile & Ballar",
+        "btn_table": "🪑 Stol Bron Qilish",
+        "btn_contact": "📞 Biz Haqimizda",
+        "lang_changed": "✅ Til o'zgartirildi: O'zbekcha",
+        "menu_header": "📋 **Verve Kitchen Menyu**\nKategoriyani tanlang:",
+        "empty_cart": "🛒 Savatchangiz bo'sh.",
+        "cart_header": "🛒 **Sizning Buyurtmangiz:**\n\n",
+        "subtotal": "Subtotal: {val:,} UZS",
+        "delivery": "Yetkazib berish: {val:,} UZS *(150,000 UZS dan oshsa bepul!)*",
+        "total": "Jami: **{val:,} UZS**",
+        "rewards": "🌟 Ushbu buyurtmadan jamg'ariladigan Verve Ballar: **+{pts} ball**",
+        "checkout": "✅ Rasmiylashtirish",
+        "clear": "🗑 Tozalash",
+        "added": "✅ Savatchaga qo'shildi!",
+        "ask_phone": "📱 Iltimos, telefon raqamingizni yuboring (pastdagi tugmani bosing):",
+        "btn_phone": "📞 Telefon raqamni ulashish",
+        "ask_location": "📍 Iltimos, yetkazib berish manzilini GPS orqali yuboring:",
+        "btn_location": "📍 Manzilni yuborish",
+        "ask_payment": "💳 To'lov turini tanlang:",
+        "pay_cash": "💵 Naqd pul",
+        "pay_online": "💳 Online (Click / Payme)",
+        "order_success": "🎉 **Buyurtmangiz muvaffaqiyatli qabul qilindi!**\n\n🧾 **Buyurtma Cheki:**\n{details}\n\n📍 GPS: Location saqlandi!\n📱 Telefon: {phone}\n💳 To'lov: {payment}\n\n🌟 Hisobingizga **+{pts} ball** qo'shildi! Operatorimiz tez orada siz bilan bog'lanadi.",
+        "profile_text": "🌟 **Sizning Verve Profilingiz**\n\n🆔 Foydalanuvchi: @{username}\n💰 Jamg'arilgan Verve Ballar: **{pts} ball**\n🎖 Status: *Verve VIP Member*\n\n_Har bir xarid uchun 1,000 UZS = 1 ball keshbek yig'ing!_",
+        "table_prompt": "🪑 **Stol Bron Qilish**\nIltimos, bron qilmoqchi bo'lgan sanangiz, vaqtingiz va kishilar sonini yuboring (Masalan: *Ertaga soat 19:00, 4 kishi*):",
+        "table_success": "✅ **Bron so'rovi qabul qilindi!**\nSizning tafsilotlaringiz: _{details}_\n\nMenejerimiz tez orada bronni tasdiqlash uchun siz bilan bog'lanadi.",
+        "contact_info": "📍 **Verve Kitchen Bukhara**\n\nManzil: Buxoro sh., B. Naqshband ko'chasi\nIsh vaqti: 10:00 - 23:00\nTelefon: +998 65 220 00 00\n\n🌟 *Verve Rewards* dasturi orqali har bir xarid uchun keshbek ballarini yig'ing!"
+    },
+    "en": {
+        "welcome": "✨ Welcome to **Verve Kitchen Bukhara**!\n\nExplore our delicious menu, book a table, or place an order. Please choose an option below:",
+        "btn_menu": "🍽 Menu",
+        "btn_cart": "🛒 Cart",
+        "btn_profile": "🌟 Verve Profile & Points",
+        "btn_table": "🪑 Book a Table",
+        "btn_contact": "📞 About Us",
+        "lang_changed": "✅ Language changed to: English",
+        "menu_header": "📋 **Verve Kitchen Menu**\nSelect a category:",
+        "empty_cart": "🛒 Your cart is currently empty.",
+        "cart_header": "🛒 **Your Order Summary:**\n\n",
+        "subtotal": "Subtotal: {val:,} UZS",
+        "delivery": "Delivery: {val:,} UZS *(Free on orders over 150,000 UZS!)*",
+        "total": "Total: **{val:,} UZS**",
+        "rewards": "🌟 Verve Rewards earned with this order: **+{pts} pts**",
+        "checkout": "✅ Checkout",
+        "clear": "🗑 Clear Cart",
+        "added": "✅ Added to cart!",
+        "ask_phone": "📱 Please share your contact phone number using the button below:",
+        "btn_phone": "📞 Share Phone Number",
+        "ask_location": "📍 Please share your exact delivery GPS location:",
+        "btn_location": "📍 Share Location",
+        "ask_payment": "💳 Select your payment method:",
+        "pay_cash": "💵 Cash on Delivery",
+        "pay_online": "💳 Online Payment (Click / Payme)",
+        "order_success": "🎉 **Order Placed Successfully!**\n\n🧾 **Order Receipt:**\n{details}\n\n📍 GPS: Location saved!\n📱 Phone: {phone}\n💳 Payment: {payment}\n\n🌟 **+{pts} points** added to your Verve balance! Our operator will contact you shortly.",
+        "profile_text": "🌟 **Your Verve Profile**\n\n🆔 User: @{username}\n💰 Total Verve Points: **{pts} pts**\n🎖 Status: *Verve VIP Member*\n\n_Earn 1 pt for every 1,000 UZS spent!_",
+        "table_prompt": "🪑 **Table Reservation**\nPlease enter the date, time, and number of guests (e.g., *Tomorrow at 7 PM, 4 people*):",
+        "table_success": "✅ **Reservation Request Received!**\nDetails: _{details}_\n\nOur manager will call you shortly to confirm your table.",
+        "contact_info": "📍 **Verve Kitchen Bukhara**\n\nAddress: B. Naqshband St, Bukhara\nHours: 10:00 AM - 11:00 PM\nPhone: +998 65 220 00 00\n\n🌟 Earn cashback points with every purchase through our *Verve Rewards* program!"
+    },
+    "ru": {
+        "welcome": "✨ Добро пожаловать в **Verve Kitchen Bukhara**!\n\nИзучите наше меню, забронируйте столик или сделайте заказ. Выберите нужный раздел:",
+        "btn_menu": "🍽 Меню",
+        "btn_cart": "🛒 Корзина",
+        "btn_profile": "🌟 Профиль Verve & Баллы",
+        "btn_table": "🪑 Бронь столика",
+        "btn_contact": "📞 О нас",
+        "lang_changed": "✅ Язык изменен: Русский",
+        "menu_header": "📋 **Меню Verve Kitchen**\nВыберите категорию:",
+        "empty_cart": "🛒 Ваша корзина пуста.",
+        "cart_header": "🛒 **Ваш заказ:**\n\n",
+        "subtotal": "Сумма: {val:,} UZS",
+        "delivery": "Доставка: {val:,} UZS *(Бесплатно от 150,000 UZS!)*",
+        "total": "Итого: **{val:,} UZS**",
+        "rewards": "🌟 Баллы Verve Rewards к начислению: **+{pts} б.**",
+        "checkout": "✅ Оформить заказ",
+        "clear": "🗑 Очистить корзину",
+        "added": "✅ Добавлено в корзину!",
+        "ask_phone": "📱 Пожалуйста, поделитесь номером телефона, нажав кнопку ниже:",
+        "btn_phone": "📞 Отправить номер телефона",
+        "ask_location": "📍 Пожалуйста, отправьте ваши GPS координаты для доставки:",
+        "btn_location": "📍 Отправить локацию",
+        "ask_payment": "💳 Выберите способ оплаты:",
+        "pay_cash": "💵 Наличными курьеру",
+        "pay_online": "💳 Онлайн оплата (Click / Payme)",
+        "order_success": "🎉 **Заказ успешно принят!**\n\n🧾 **Чек заказа:**\n{details}\n\n📍 GPS: Локация сохранена!\n📱 Телефон: {phone}\n💳 Оплата: {payment}\n\n🌟 **+{pts} баллов** добавлено на ваш счет! Наш оператор свяжется с вами в ближайшее время.",
+        "profile_text": "🌟 **Ваш профиль Verve**\n\n🆔 Пользователь: @{username}\n💰 Баланс баллов Verve: **{pts} б.**\n🎖 Статус: *VIP Участник Verve*\n\n_Копите 1 балл за каждые 1,000 UZS покупок!_",
+        "table_prompt": "🪑 **Бронирование столика**\nПожалуйста, укажите дату, время и количество гостей (например, *Завтра в 19:00, 4 человека*):",
+        "table_success": "✅ **Заявка на бронь принята!**\nДетали: _{details}_\n\nНаш менеджер перезвонит вам в ближайшее время для подтверждения.",
+        "contact_info": "📍 **Verve Kitchen Bukhara**\n\nАдрес: ул. Б. Накшбанд, Бухара\nЧасы работы: 10:00 - 23:00\nТелефон: +998 65 220 00 00\n\n🌟 Копите кэшбэк-баллы с каждой покупки с программой *Verve Rewards*!"
+    }
+}
+
+USER_STATE = {}
+
+
+def get_user_session(user_id: int) -> dict:
+    if user_id not in USER_STATE:
+        USER_STATE[user_id] = {
+            "lang": "uz",
+            "cart": {},
+            "points": 0,
+            "phone": None,
+            "location": None
+        }
+    return USER_STATE[user_id]
+
+
+# ==================== KEYBOARDS ====================
+
+def get_language_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🇺🇿 O'zbekcha", callback_data="lang_uz"),
+            InlineKeyboardButton(text="🇬🇧 English", callback_data="lang_en"),
+            InlineKeyboardButton(text="🇷🇺 Русский", callback_data="lang_ru")
+        ]
+    ])
+
+
+def get_main_reply_keyboard(lang: str) -> ReplyKeyboardMarkup:
+    t = UI_TEXT[lang]
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=t["btn_menu"]), KeyboardButton(text=t["btn_cart"])],
+            [KeyboardButton(text=t["btn_profile"]), KeyboardButton(text=t["btn_table"])],
+            [KeyboardButton(text=t["btn_contact"])]
+        ],
+        resize_keyboard=True
+    )
+
+
+# ==================== HANDLERS ====================
+
+@router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    session = get_user_session(user_id)
+    lang = session["lang"]
+    t = UI_TEXT[lang]
+
+    await message.answer(
+        "🌍 *Verve Kitchen Bukhara*\nPlease choose your preferred language / Tilni tanlang / Выберите язык:",
+        reply_markup=get_language_keyboard(),
+        parse_mode="Markdown"
+    )
+    await message.answer(t["welcome"], reply_markup=get_main_reply_keyboard(lang), parse_mode="Markdown")
+
+
+@router.callback_query(F.data.startswith("lang_"))
+async def callback_language(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    new_lang = callback.data.split("_")[1]
+    session = get_user_session(user_id)
+    session["lang"] = new_lang
+    t = UI_TEXT[new_lang]
+
+    await callback.answer(t["lang_changed"])
+    await callback.message.edit_text(
+        f"🌍 *Verve Kitchen Bukhara*\n{t['lang_changed']}",
+        reply_markup=get_language_keyboard()
+    )
+    await callback.message.answer(
+        t["welcome"],
+        reply_markup=get_main_reply_keyboard(new_lang),
+        parse_mode="Markdown"
+    )
+
+
+@router.message(F.text.in_({UI_TEXT["uz"]["btn_menu"], UI_TEXT["en"]["btn_menu"], UI_TEXT["ru"]["btn_menu"]}))
+async def show_menu(message: Message, state: FSMContext):
+    await state.clear()
+    session = get_user_session(message.from_user.id)
+    lang = session["lang"]
+    t = UI_TEXT[lang]
+    cat_data = MENU_DATA[lang]
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=cat_data["cat_mains"], callback_data="show_cat_mains")],
+        [InlineKeyboardButton(text=cat_data["cat_fast"], callback_data="show_cat_fast")],
+        [InlineKeyboardButton(text=cat_data["cat_drinks"], callback_data="show_cat_drinks")]
+    ])
+
+    await message.answer(t["menu_header"], reply_markup=keyboard, parse_mode="Markdown")
+
+
+@router.callback_query(F.data.startswith("show_cat_"))
+async def show_category_items(callback: CallbackQuery):
+    session = get_user_session(callback.from_user.id)
+    lang = session["lang"]
+    cat_key = callback.data.replace("show_cat_", "cat_")
+
+    menu_items = MENU_DATA[lang]["items"]
+    filtered_items = {k: v for k, v in menu_items.items() if v["cat"] == cat_key}
+
+    buttons = []
+    for item_id, info in filtered_items.items():
+        btn_text = f"{info['name']} — {info['price']:,} UZS"
+        buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"item_{item_id}")])
+
+    buttons.append([InlineKeyboardButton(text="⬅️ Back to Categories", callback_data="back_to_menu")])
+
+    await callback.message.edit_text(
+        f"📋 *{MENU_DATA[lang][cat_key]}*\nSelect an item to view details:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "back_to_menu")
+async def back_to_menu(callback: CallbackQuery):
+    session = get_user_session(callback.from_user.id)
+    lang = session["lang"]
+    t = UI_TEXT[lang]
+    cat_data = MENU_DATA[lang]
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=cat_data["cat_mains"], callback_data="show_cat_mains")],
+        [InlineKeyboardButton(text=cat_data["cat_fast"], callback_data="show_cat_fast")],
+        [InlineKeyboardButton(text=cat_data["cat_drinks"], callback_data="show_cat_drinks")]
+    ])
+
+    await callback.message.edit_text(t["menu_header"], reply_markup=keyboard, parse_mode="Markdown")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("item_"))
+async def show_item_detail(callback: CallbackQuery):
+    session = get_user_session(callback.from_user.id)
+    lang = session["lang"]
+    item_id = callback.data.replace("item_", "")
+
+    item = MENU_DATA[lang]["items"].get(item_id)
+    if not item:
+        await callback.answer("Item not found.")
+        return
+
+    text = f"🍽 **{item['name']}**\n\n_{item['desc']}_\n\n💰 **Price:** {item['price']:,} UZS"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Add to Cart", callback_data=f"add_{item_id}")],
+        [InlineKeyboardButton(text="⬅️ Back", callback_data=f"show_cat_{item['cat'].replace('cat_', '')}")]
+    ])
+
+    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("add_"))
+async def add_to_cart(callback: CallbackQuery):
+    session = get_user_session(callback.from_user.id)
+    lang = session["lang"]
+    item_id = callback.data.replace("add_", "")
+
+    cart = session["cart"]
+    cart[item_id] = cart.get(item_id, 0) + 1
+
+    t = UI_TEXT[lang]
+    await callback.answer(t["added"], show_alert=False)
+
+
+@router.message(F.text.in_({UI_TEXT["uz"]["btn_cart"], UI_TEXT["en"]["btn_cart"], UI_TEXT["ru"]["btn_cart"]}))
+async def show_cart(message: Message, state: FSMContext):
+    await state.clear()
+    session = get_user_session(message.from_user.id)
+    lang = session["lang"]
+    t = UI_TEXT[lang]
+    cart = session["cart"]
+
+    if not cart:
+        await message.answer(t["empty_cart"])
+        return
+
+    subtotal = 0
+    response_lines = [t["cart_header"]]
+
+    menu_items = MENU_DATA[lang]["items"]
+    for item_id, qty in cart.items():
+        item = menu_items.get(item_id)
+        if item:
+            item_total = item["price"] * qty
+            subtotal += item_total
+            response_lines.append(f"• {item['name']} x {qty} = **{item_total:,} UZS**\n")
+
+    delivery_fee = 0 if subtotal >= 150000 or subtotal == 0 else 12000
+    total = subtotal + delivery_fee
+    rewards_pts = subtotal // 1000
+
+    response_lines.append(f"\n{t['subtotal'].format(val=subtotal)}")
+    response_lines.append(f"\n{t['delivery'].format(val=delivery_fee)}")
+    response_lines.append(f"\n{t['total'].format(val=total)}")
+    response_lines.append(f"\n{t['rewards'].format(pts=rewards_pts)}")
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=t["checkout"], callback_data="start_checkout")],
+        [InlineKeyboardButton(text=t["clear"], callback_data="clear_cart")]
+    ])
+
+    await message.answer("".join(response_lines), reply_markup=keyboard, parse_mode="Markdown")
+
+
+@router.callback_query(F.data == "clear_cart")
+async def clear_cart(callback: CallbackQuery):
+    session = get_user_session(callback.from_user.id)
+    lang = session["lang"]
+    session["cart"].clear()
+
+    await callback.message.edit_text(UI_TEXT[lang]["empty_cart"])
+    await callback.answer()
+
+
+# ==================== CHECKOUT & PAYMENT FLOW ====================
+
+@router.callback_query(F.data == "start_checkout")
+async def checkout_start(callback: CallbackQuery, state: FSMContext):
+    session = get_user_session(callback.from_user.id)
+    lang = session["lang"]
+    t = UI_TEXT[lang]
+
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=t["btn_phone"], request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+
+    await callback.message.answer(t["ask_phone"], reply_markup=keyboard)
+    await state.set_state(CheckoutState.waiting_for_phone)
+    await callback.answer()
+
+
+@router.message(CheckoutState.waiting_for_phone, F.contact)
+async def checkout_got_phone(message: Message, state: FSMContext):
+    session = get_user_session(message.from_user.id)
+    lang = session["lang"]
+    t = UI_TEXT[lang]
+
+    session["phone"] = message.contact.phone_number
+
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=t["btn_location"], request_location=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+
+    await message.answer(t["ask_location"], reply_markup=keyboard)
+    await state.set_state(CheckoutState.waiting_for_location)
+
+
+@router.message(CheckoutState.waiting_for_location, F.location)
+async def checkout_got_location(message: Message, state: FSMContext):
+    session = get_user_session(message.from_user.id)
+    lang = session["lang"]
+    t = UI_TEXT[lang]
+
+    session["location"] = (message.location.latitude, message.location.longitude)
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=t["pay_cash"], callback_data="pay_cash")],
+        [InlineKeyboardButton(text=t["pay_online"], callback_data="pay_online")]
+    ])
+
+    await message.answer(t["ask_payment"], reply_markup=keyboard)
+    await state.set_state(CheckoutState.waiting_for_payment)
+
+
+@router.callback_query(CheckoutState.waiting_for_payment, F.data.startswith("pay_"))
+async def finalize_order(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    session = get_user_session(user_id)
+    lang = session["lang"]
+    t = UI_TEXT[lang]
+
+    pay_method = t["pay_cash"] if callback.data == "pay_cash" else t["pay_online"]
+    cart = session["cart"]
+
+    subtotal = sum(MENU_DATA[lang]["items"][item_id]["price"] * qty for item_id, qty in cart.items())
+    delivery_fee = 0 if subtotal >= 150000 or subtotal == 0 else 12000
+    total = subtotal + delivery_fee
+    earned_pts = subtotal // 1000
+
+    order_items_text = "\n".join(
+        [f"• {MENU_DATA[lang]['items'][item_id]['name']} x {qty}" for item_id, qty in cart.items()])
+    summary_details = f"{order_items_text}\n\n💰 Total: **{total:,} UZS**"
+
+    success_text = t["order_success"].format(
+        details=summary_details,
+        phone=session["phone"],
+        payment=pay_method,
+        pts=earned_pts
+    )
+
+    order_items = [
+        {
+            "id": item_id,
+            "name": MENU_DATA[lang]["items"][item_id]["name"],
+            "qty": qty,
+            "unit": MENU_DATA[lang]["items"][item_id]["price"],
+            "options": {}
+        }
+        for item_id, qty in cart.items()
+    ]
+    username = callback.from_user.username or callback.from_user.first_name or "Telegram customer"
+    latitude, longitude = session["location"] if session["location"] else (None, None)
+    order = {
+        "id": f"TG-{uuid.uuid4().hex[:10].upper()}",
+        "createdAt": datetime.now(timezone.utc).isoformat(),
+        "mode": "delivery",
+        "status": "accepted",
+        "source": "telegram",
+        "customer": {
+            "name": username,
+            "phone": session["phone"],
+            "address": "Telegram delivery",
+            "date": "",
+            "time": "",
+            "guests": "",
+            "table": "",
+            "note": "",
+            "latitude": latitude,
+            "longitude": longitude
+        },
+        "items": order_items,
+        "codes": [],
+        "rewards": {"pointsEarned": earned_pts, "pointsRedeemed": 0},
+        "totals": {"subtotal": subtotal, "discount": 0, "delivery": delivery_fee, "total": total},
+        "payment": pay_method,
+        "telegramUserId": user_id
+    }
+
+    try:
+        await send_order_to_website(order)
+    except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError, RuntimeError) as error:
+        logging.exception("Could not send Telegram order %s to the website.", order["id"])
+        await callback.message.answer(
+            "⚠️ Your order was prepared, but the dashboard server could not save it. Please try again."
+        )
+        await callback.answer()
+        return
+
+    session["points"] += earned_pts
+    cart.clear()
+    await state.clear()
+
+    await callback.message.answer(success_text, reply_markup=get_main_reply_keyboard(lang), parse_mode="Markdown")
+    await callback.message.delete()
+    await callback.answer()
+
+
+# ==================== VERVE PROFILE HANDLER ====================
+
+@router.message(F.text.in_({UI_TEXT["uz"]["btn_profile"], UI_TEXT["en"]["btn_profile"], UI_TEXT["ru"]["btn_profile"]}))
+async def show_profile(message: Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    session = get_user_session(user_id)
+    lang = session["lang"]
+    t = UI_TEXT[lang]
+
+    username = message.from_user.username or message.from_user.first_name
+    text = t["profile_text"].format(username=username, pts=session["points"])
+
+    await message.answer(text, parse_mode="Markdown")
+
+
+# ==================== TABLE RESERVATION & CONTACT ====================
+
+@router.message(F.text.in_({UI_TEXT["uz"]["btn_table"], UI_TEXT["en"]["btn_table"], UI_TEXT["ru"]["btn_table"]}))
+async def book_table_prompt(message: Message, state: FSMContext):
+    session = get_user_session(message.from_user.id)
+    lang = session["lang"]
+    t = UI_TEXT[lang]
+    await message.answer(t["table_prompt"], parse_mode="Markdown")
+    await state.set_state(TableState.waiting_for_details)
+
+
+@router.message(TableState.waiting_for_details)
+async def book_table_receive(message: Message, state: FSMContext):
+    session = get_user_session(message.from_user.id)
+    lang = session["lang"]
+    t = UI_TEXT[lang]
+
+    await state.clear()
+    await message.answer(
+        t["table_success"].format(details=message.text),
+        reply_markup=get_main_reply_keyboard(lang),
+        parse_mode="Markdown"
+    )
+
+
+@router.message(F.text.in_({UI_TEXT["uz"]["btn_contact"], UI_TEXT["en"]["btn_contact"], UI_TEXT["ru"]["btn_contact"]}))
+async def show_contact(message: Message, state: FSMContext):
+    await state.clear()
+    session = get_user_session(message.from_user.id)
+    lang = session["lang"]
+    t = UI_TEXT[lang]
+    await message.answer(t["contact_info"], parse_mode="Markdown")
+
+
+# ==================== MAIN STARTUP ====================
+
+async def main():
+    dp = Dispatcher()
+    dp.include_router(router)
+
+    await bot.delete_webhook(drop_pending_updates=True)
+    start_order_server()
+    logging.info("Verve Restaurant is ready to connect the local host...")
+
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
